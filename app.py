@@ -19,6 +19,17 @@ import streamlit as st
 
 BASE_URL = "https://server.smartlead.ai/api/v1"
 
+# Operator-facing UI stays intentionally simple. These are safe internal defaults.
+DEFAULT_CONCURRENCY = 8
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 60
+DEFAULT_MAX_RETRIES = 4
+DEFAULT_RETRY_BASE_SECONDS = 1.5
+DEFAULT_RETRY_MAX_SECONDS = 30.0
+DEFAULT_VERIFY_AFTER_LIVE_UPDATE = True
+DEFAULT_ENABLE_LEGACY_TRACKING_FALLBACK_ON_422 = True
+DEFAULT_INCLUDE_EXISTING_CAMPAIGN_NAME_IN_PAYLOAD = False
+DEFAULT_SKIP_ARCHIVED_CAMPAIGNS = False
+
 PRIMARY_SETTINGS_PAYLOAD = {
     "track_settings": ["DONT_TRACK_EMAIL_OPEN", "DONT_TRACK_LINK_CLICK"],
     "send_as_plain_text": True,
@@ -160,6 +171,13 @@ def flatten_for_csv(value: Any) -> Any:
     if isinstance(value, (dict, list)):
         return json.dumps(value, ensure_ascii=False)
     return value
+
+
+def dataframe_flatten_for_csv(df: pd.DataFrame) -> pd.DataFrame:
+    """Flatten nested values for CSV export without using deprecated pandas APIs."""
+    if df.empty:
+        return df.copy()
+    return df.apply(lambda series: series.map(flatten_for_csv))
 
 
 def extract_campaign_list(api_response: Any) -> List[Dict[str, Any]]:
@@ -653,19 +671,38 @@ def build_zip_bytes(files: Dict[str, pd.DataFrame]) -> bytes:
     return buffer.getvalue()
 
 
-def get_configured_password() -> Optional[str]:
-    password = os.getenv("STREAMLIT_APP_PASSWORD")
-    if password:
-        return password
+def get_secret_or_env(name: str) -> Optional[str]:
+    value = os.getenv(name)
+    if value:
+        return str(value)
 
     try:
-        password = st.secrets.get("APP_PASSWORD")
-        if password:
-            return str(password)
+        value = st.secrets.get(name)
+        if value:
+            return str(value)
     except Exception:
         pass
 
     return None
+
+
+def get_configured_password() -> Optional[str]:
+    return get_secret_or_env("STREAMLIT_APP_PASSWORD") or get_secret_or_env("APP_PASSWORD")
+
+
+def get_configured_api_key() -> Optional[str]:
+    return get_secret_or_env("SMARTLEAD_API_KEY")
+
+
+def get_optional_int_config(name: str) -> Optional[int]:
+    raw_value = get_secret_or_env(name)
+    if raw_value is None or not str(raw_value).strip():
+        return None
+
+    try:
+        return int(str(raw_value).strip())
+    except ValueError:
+        return None
 
 
 def require_password_login() -> None:
@@ -719,36 +756,17 @@ def main() -> None:
     require_password_login()
 
     st.title("Smartlead Campaign Settings Updater")
-    st.caption("Bulk apply required campaign settings to parent campaigns and matched subsequences.")
+    st.caption("Upload or paste parent campaign IDs, preview matched parents and subsequences, then apply the required Smartlead settings.")
 
-    with st.sidebar:
-        st.header("Smartlead")
+    api_key = get_configured_api_key()
+    if api_key:
+        st.success("Smartlead API key loaded from Streamlit secrets.")
+    else:
         api_key = st.text_input("Smartlead API key", type="password")
+        if not api_key:
+            st.warning("Add SMARTLEAD_API_KEY to Streamlit secrets to avoid asking operators for the API key every time.")
 
-        st.header("Execution")
-        dry_run = st.toggle("Dry run, build plan only", value=True)
-        verify_after_update = st.toggle("Verify after live update", value=True, disabled=dry_run)
-        include_parent_campaigns = st.toggle("Include parent campaigns", value=True)
-        include_subsequences = st.toggle("Include subsequences", value=True)
-        skip_archived_campaigns = st.toggle("Skip archived campaigns", value=False)
-
-        st.header("Advanced")
-        client_id_text = st.text_input("Optional client_id filter", value="")
-        concurrency = st.slider("Concurrency", min_value=1, max_value=25, value=8)
-        request_timeout_seconds = st.slider("Request timeout seconds", min_value=10, max_value=180, value=60, step=5)
-        max_retries = st.slider("Max retries", min_value=1, max_value=8, value=4)
-        retry_base_seconds = st.number_input("Retry base seconds", min_value=0.5, max_value=10.0, value=1.5, step=0.5)
-        retry_max_seconds = st.number_input("Retry max seconds", min_value=5.0, max_value=120.0, value=30.0, step=5.0)
-        enable_legacy_tracking_fallback_on_422 = st.toggle("Retry legacy tracking aliases on 422", value=True)
-        include_existing_campaign_name_in_payload = st.toggle("Include existing campaign name in update payload", value=False)
-
-    client_id_filter: Optional[int] = None
-    if client_id_text.strip():
-        try:
-            client_id_filter = int(client_id_text.strip())
-        except ValueError:
-            st.error("client_id filter must be an integer.")
-            st.stop()
+    client_id_filter = get_optional_int_config("SMARTLEAD_CLIENT_ID_FILTER")
 
     st.subheader("1. Campaign input")
     input_method = st.radio(
@@ -760,14 +778,13 @@ def main() -> None:
     valid_campaign_ids: List[int] = []
     invalid_manual_values: List[str] = []
     invalid_csv_rows_df = pd.DataFrame()
-    input_raw_df = pd.DataFrame()
     detected_campaign_id_column = ""
 
     if input_method == "CSV upload":
         uploaded_file = st.file_uploader("Upload CSV containing campaign IDs", type=["csv"])
         if uploaded_file:
             try:
-                valid_campaign_ids, input_raw_df, invalid_csv_rows_df, detected_campaign_id_column = read_campaign_ids_from_csv(uploaded_file)
+                valid_campaign_ids, _, invalid_csv_rows_df, detected_campaign_id_column = read_campaign_ids_from_csv(uploaded_file)
                 st.success(f"Detected campaign ID column: {detected_campaign_id_column}")
             except Exception as exc:
                 st.error(str(exc))
@@ -776,7 +793,7 @@ def main() -> None:
         manual_ids_text = st.text_area(
             "Paste campaign IDs",
             placeholder="3529654, 3529659, 3529665",
-            height=120,
+            height=100,
         )
         valid_campaign_ids, invalid_manual_values = parse_manual_campaign_ids(manual_ids_text)
 
@@ -784,7 +801,7 @@ def main() -> None:
         st.write(f"Parsed **{len(valid_campaign_ids):,} unique campaign IDs**.")
         st.dataframe(pd.DataFrame({"campaign_id": valid_campaign_ids}).head(1000), use_container_width=True)
     else:
-        st.info("Add campaign IDs to continue.")
+        st.info("Add campaign IDs to preview the update plan.")
 
     if invalid_manual_values:
         st.warning(f"Skipped invalid manual values: {', '.join(invalid_manual_values[:50])}")
@@ -793,195 +810,217 @@ def main() -> None:
         with st.expander(f"Invalid CSV rows skipped: {len(invalid_csv_rows_df):,}"):
             st.dataframe(invalid_csv_rows_df.head(1000), use_container_width=True)
 
-    st.subheader("2. Target settings")
-    st.json(PRIMARY_SETTINGS_PAYLOAD)
+    st.subheader("2. Run options")
+    option_col1, option_col2, option_col3 = st.columns(3)
+    with option_col1:
+        dry_run = st.toggle("Dry run", value=True, help="Preview and export the plan without updating Smartlead.")
+    with option_col2:
+        include_parent_campaigns = st.toggle("Include parent campaigns", value=True)
+    with option_col3:
+        include_subsequences = st.toggle("Include subsequences", value=True)
 
-    can_run = bool(api_key and valid_campaign_ids)
-    run_clicked = st.button(
-        "Build plan and run",
-        type="primary",
-        disabled=not can_run,
+    st.subheader("3. Settings to update")
+    settings_display_df = pd.DataFrame(
+        [
+            {"Setting": "Tracking", "New value": "Disable email open tracking and link click tracking"},
+            {"Setting": "Plain text", "New value": "send_as_plain_text = true"},
+            {"Setting": "AI ESP matching", "New value": "enable_ai_esp_matching = false"},
+        ]
     )
+    st.dataframe(settings_display_df, use_container_width=True, hide_index=True)
 
-    if not api_key:
-        st.warning("Enter your Smartlead API key in the sidebar.")
+    if not api_key or not valid_campaign_ids:
+        st.stop()
 
-    if run_clicked:
-        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_files: Dict[str, pd.DataFrame] = {}
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_files: Dict[str, pd.DataFrame] = {}
 
-        try:
-            with st.spinner("Fetching campaigns from Smartlead..."):
-                campaigns = fetch_all_campaigns_cached(
-                    api_key=api_key,
-                    client_id_filter=client_id_filter,
-                    request_timeout_seconds=request_timeout_seconds,
-                )
-
-            all_campaigns_df = prepare_campaigns_dataframe(campaigns)
-            all_campaigns_snapshot_df = compact_campaign_snapshot(all_campaigns_df.copy()).applymap(flatten_for_csv)
-            output_files["01_all_campaigns_snapshot.csv"] = all_campaigns_snapshot_df
-
-            plan_df, input_campaigns_found_df, subsequence_df, missing_campaign_ids_df = build_update_plan(
-                all_campaigns_df=all_campaigns_df,
-                valid_campaign_ids=valid_campaign_ids,
-                include_parent_campaigns=include_parent_campaigns,
-                include_subsequences=include_subsequences,
-                skip_archived_campaigns=skip_archived_campaigns,
+    try:
+        st.subheader("4. Preview")
+        with st.spinner("Fetching campaigns and building preview..."):
+            campaigns = fetch_all_campaigns_cached(
+                api_key=api_key,
+                client_id_filter=client_id_filter,
+                request_timeout_seconds=DEFAULT_REQUEST_TIMEOUT_SECONDS,
             )
 
-            output_files["02_input_campaign_ids.csv"] = pd.DataFrame({"campaign_id": valid_campaign_ids})
-            output_files["03_missing_campaign_ids.csv"] = missing_campaign_ids_df
+        all_campaigns_df = prepare_campaigns_dataframe(campaigns)
+        all_campaigns_snapshot_df = dataframe_flatten_for_csv(compact_campaign_snapshot(all_campaigns_df.copy()))
+        output_files["01_all_campaigns_snapshot.csv"] = all_campaigns_snapshot_df
 
-            if plan_df.empty:
-                st.error("Update plan is empty. No campaigns or subsequences matched your selected options.")
-                st.stop()
+        plan_df, input_campaigns_found_df, subsequence_df, missing_campaign_ids_df = build_update_plan(
+            all_campaigns_df=all_campaigns_df,
+            valid_campaign_ids=valid_campaign_ids,
+            include_parent_campaigns=include_parent_campaigns,
+            include_subsequences=include_subsequences,
+            skip_archived_campaigns=DEFAULT_SKIP_ARCHIVED_CAMPAIGNS,
+        )
 
-            plan_export_df = select_plan_export_columns(plan_df).applymap(flatten_for_csv)
-            output_files["04_update_plan.csv"] = plan_export_df
+        output_files["02_input_campaign_ids.csv"] = pd.DataFrame({"campaign_id": valid_campaign_ids})
+        output_files["03_missing_campaign_ids.csv"] = missing_campaign_ids_df
 
-            render_summary_cards(
-                valid_campaign_ids=valid_campaign_ids,
-                input_found_count=len(input_campaigns_found_df),
-                subsequence_count=len(subsequence_df),
-                missing_count=len(missing_campaign_ids_df),
-                plan_count=len(plan_df),
+        render_summary_cards(
+            valid_campaign_ids=valid_campaign_ids,
+            input_found_count=len(input_campaigns_found_df),
+            subsequence_count=len(subsequence_df),
+            missing_count=len(missing_campaign_ids_df),
+            plan_count=len(plan_df),
+        )
+
+        if plan_df.empty:
+            st.error("Update plan is empty. No campaigns or subsequences matched your selected options.")
+            st.stop()
+
+        plan_export_df = dataframe_flatten_for_csv(select_plan_export_columns(plan_df))
+        output_files["04_update_plan.csv"] = plan_export_df
+
+        st.dataframe(plan_export_df, use_container_width=True)
+
+        if dry_run:
+            st.info("Dry run is on. No Smartlead updates will be sent.")
+            summary_df = pd.DataFrame(
+                [
+                    {"metric": "dry_run", "value": True},
+                    {"metric": "input_ids", "value": len(valid_campaign_ids)},
+                    {"metric": "input_campaigns_found", "value": len(input_campaigns_found_df)},
+                    {"metric": "subsequences_matched", "value": len(subsequence_df)},
+                    {"metric": "missing_campaign_ids", "value": len(missing_campaign_ids_df)},
+                    {"metric": "total_plan_rows", "value": len(plan_df)},
+                ]
             )
+            output_files["05_run_summary.csv"] = summary_df
 
-            st.subheader("3. Update plan")
-            st.dataframe(plan_export_df, use_container_width=True)
-
-            if dry_run:
-                st.info("Dry run selected. No Smartlead settings updates were sent.")
-                summary_df = pd.DataFrame(
-                    [
-                        {"metric": "dry_run", "value": True},
-                        {"metric": "input_ids", "value": len(valid_campaign_ids)},
-                        {"metric": "input_campaigns_found", "value": len(input_campaigns_found_df)},
-                        {"metric": "subsequences_matched", "value": len(subsequence_df)},
-                        {"metric": "missing_campaign_ids", "value": len(missing_campaign_ids_df)},
-                        {"metric": "total_plan_rows", "value": len(plan_df)},
-                    ]
-                )
-                output_files["05_run_summary.csv"] = summary_df
-                final_result_df = plan_export_df.copy()
-                final_result_df["run_mode"] = "dry_run_plan_only"
-            else:
-                st.subheader("4. Live update")
-                started = time.time()
-
-                results_df = run_updates_with_progress(
-                    api_key=api_key,
-                    plan_df=plan_df,
-                    concurrency=concurrency,
-                    request_timeout_seconds=request_timeout_seconds,
-                    max_retries=max_retries,
-                    retry_base_seconds=retry_base_seconds,
-                    retry_max_seconds=retry_max_seconds,
-                    enable_legacy_tracking_fallback_on_422=enable_legacy_tracking_fallback_on_422,
-                    include_existing_campaign_name_in_payload=include_existing_campaign_name_in_payload,
-                )
-                elapsed_seconds = round(time.time() - started, 2)
-
-                export_results_df = results_df.copy()
-                for col in export_results_df.columns:
-                    export_results_df[col] = export_results_df[col].apply(flatten_for_csv)
-
-                output_files["05_update_results.csv"] = export_results_df
-
-                success_count = int(results_df["success"].sum()) if "success" in results_df.columns else 0
-                failure_count = int((~results_df["success"]).sum()) if "success" in results_df.columns else len(results_df)
-
-                summary_df = pd.DataFrame(
-                    [
-                        {"metric": "total_attempted", "value": len(results_df)},
-                        {"metric": "successful", "value": success_count},
-                        {"metric": "failed", "value": failure_count},
-                        {"metric": "elapsed_seconds", "value": elapsed_seconds},
-                        {"metric": "concurrency", "value": concurrency},
-                        {"metric": "dry_run", "value": False},
-                    ]
-                )
-                output_files["06_update_summary.csv"] = summary_df
-
-                st.success(
-                    f"Live update complete. Attempted {len(results_df):,}, "
-                    f"successful {success_count:,}, failed {failure_count:,}."
-                )
-                st.dataframe(export_results_df, use_container_width=True)
-
-                failed_df = results_df[~results_df["success"]].copy() if "success" in results_df.columns else pd.DataFrame()
-                if not failed_df.empty:
-                    export_failed_df = failed_df.copy()
-                    for col in export_failed_df.columns:
-                        export_failed_df[col] = export_failed_df[col].apply(flatten_for_csv)
-                    output_files["07_failed_updates.csv"] = export_failed_df
-                    with st.expander(f"Failed updates: {len(export_failed_df):,}", expanded=True):
-                        st.dataframe(export_failed_df, use_container_width=True)
-
-                final_result_df = plan_export_df.merge(
-                    export_results_df,
-                    on="campaign_id",
-                    how="left",
-                    suffixes=("_plan", "_update"),
-                )
-
-                if verify_after_update:
-                    st.subheader("5. Verification")
-                    with st.spinner("Re-fetching campaigns and verifying settings..."):
-                        verification_df = verify_updated_settings(
-                            api_key=api_key,
-                            plan_df=plan_df,
-                            client_id_filter=client_id_filter,
-                            request_timeout_seconds=request_timeout_seconds,
-                        )
-
-                    verification_export_df = verification_df.copy()
-                    for col in verification_export_df.columns:
-                        verification_export_df[col] = verification_export_df[col].apply(flatten_for_csv)
-
-                    output_files["08_verification_after_update.csv"] = verification_export_df
-
-                    ok_count = int(verification_df["all_requested_settings_ok"].sum()) if "all_requested_settings_ok" in verification_df.columns else 0
-                    not_ok_count = int((~verification_df["all_requested_settings_ok"]).sum()) if "all_requested_settings_ok" in verification_df.columns else len(verification_df)
-
-                    if not_ok_count:
-                        st.warning(f"Verification complete. OK: {ok_count:,}. Not OK: {not_ok_count:,}.")
-                    else:
-                        st.success(f"Verification complete. OK: {ok_count:,}. Not OK: {not_ok_count:,}.")
-
-                    st.dataframe(verification_export_df, use_container_width=True)
-
-                    final_result_df = final_result_df.merge(
-                        verification_export_df,
-                        on="campaign_id",
-                        how="left",
-                        suffixes=("", "_verified"),
-                    )
-
-            output_files["99_final_result.csv"] = final_result_df.applymap(flatten_for_csv)
+            final_result_df = plan_export_df.copy()
+            final_result_df["run_mode"] = "dry_run_plan_only"
+            output_files["99_final_result.csv"] = dataframe_flatten_for_csv(final_result_df)
 
             st.subheader("Downloads")
-            result_csv_bytes = dataframe_to_csv_bytes(output_files["99_final_result.csv"])
-            zip_bytes = build_zip_bytes(output_files)
-
             st.download_button(
-                label="Download final result CSV",
-                data=result_csv_bytes,
-                file_name=f"smartlead_campaign_settings_result_{run_id}.csv",
+                label="Download preview CSV",
+                data=dataframe_to_csv_bytes(output_files["99_final_result.csv"]),
+                file_name=f"smartlead_campaign_settings_preview_{run_id}.csv",
                 mime="text/csv",
             )
-
             st.download_button(
                 label="Download all outputs as ZIP",
-                data=zip_bytes,
-                file_name=f"smartlead_campaign_settings_outputs_{run_id}.zip",
+                data=build_zip_bytes(output_files),
+                file_name=f"smartlead_campaign_settings_preview_outputs_{run_id}.zip",
                 mime="application/zip",
             )
+            st.stop()
 
-        except Exception as exc:
-            st.error(str(exc))
-            st.exception(exc)
+        st.warning("Dry run is off. Clicking the button below will update Smartlead campaign settings.")
+        run_clicked = st.button(
+            f"Apply settings to {len(plan_df):,} campaigns",
+            type="primary",
+        )
+
+        if not run_clicked:
+            st.stop()
+
+        st.subheader("5. Live update")
+        started = time.time()
+
+        results_df = run_updates_with_progress(
+            api_key=api_key,
+            plan_df=plan_df,
+            concurrency=DEFAULT_CONCURRENCY,
+            request_timeout_seconds=DEFAULT_REQUEST_TIMEOUT_SECONDS,
+            max_retries=DEFAULT_MAX_RETRIES,
+            retry_base_seconds=DEFAULT_RETRY_BASE_SECONDS,
+            retry_max_seconds=DEFAULT_RETRY_MAX_SECONDS,
+            enable_legacy_tracking_fallback_on_422=DEFAULT_ENABLE_LEGACY_TRACKING_FALLBACK_ON_422,
+            include_existing_campaign_name_in_payload=DEFAULT_INCLUDE_EXISTING_CAMPAIGN_NAME_IN_PAYLOAD,
+        )
+        elapsed_seconds = round(time.time() - started, 2)
+
+        export_results_df = dataframe_flatten_for_csv(results_df.copy())
+        output_files["05_update_results.csv"] = export_results_df
+
+        success_count = int(results_df["success"].sum()) if "success" in results_df.columns else 0
+        failure_count = int((~results_df["success"]).sum()) if "success" in results_df.columns else len(results_df)
+
+        summary_df = pd.DataFrame(
+            [
+                {"metric": "total_attempted", "value": len(results_df)},
+                {"metric": "successful", "value": success_count},
+                {"metric": "failed", "value": failure_count},
+                {"metric": "elapsed_seconds", "value": elapsed_seconds},
+                {"metric": "dry_run", "value": False},
+            ]
+        )
+        output_files["06_update_summary.csv"] = summary_df
+
+        if failure_count:
+            st.warning(f"Live update complete. Attempted {len(results_df):,}, successful {success_count:,}, failed {failure_count:,}.")
+        else:
+            st.success(f"Live update complete. Attempted {len(results_df):,}, successful {success_count:,}, failed {failure_count:,}.")
+
+        st.dataframe(export_results_df, use_container_width=True)
+
+        failed_df = results_df[~results_df["success"]].copy() if "success" in results_df.columns else pd.DataFrame()
+        if not failed_df.empty:
+            export_failed_df = dataframe_flatten_for_csv(failed_df.copy())
+            output_files["07_failed_updates.csv"] = export_failed_df
+            with st.expander(f"Failed updates: {len(export_failed_df):,}", expanded=True):
+                st.dataframe(export_failed_df, use_container_width=True)
+
+        final_result_df = plan_export_df.merge(
+            export_results_df,
+            on="campaign_id",
+            how="left",
+            suffixes=("_plan", "_update"),
+        )
+
+        if DEFAULT_VERIFY_AFTER_LIVE_UPDATE:
+            st.subheader("6. Verification")
+            with st.spinner("Re-fetching campaigns and verifying settings..."):
+                verification_df = verify_updated_settings(
+                    api_key=api_key,
+                    plan_df=plan_df,
+                    client_id_filter=client_id_filter,
+                    request_timeout_seconds=DEFAULT_REQUEST_TIMEOUT_SECONDS,
+                )
+
+            verification_export_df = dataframe_flatten_for_csv(verification_df.copy())
+            output_files["08_verification_after_update.csv"] = verification_export_df
+
+            ok_count = int(verification_df["all_requested_settings_ok"].sum()) if "all_requested_settings_ok" in verification_df.columns else 0
+            not_ok_count = int((~verification_df["all_requested_settings_ok"]).sum()) if "all_requested_settings_ok" in verification_df.columns else len(verification_df)
+
+            if not_ok_count:
+                st.warning(f"Verification complete. OK: {ok_count:,}. Not OK: {not_ok_count:,}.")
+            else:
+                st.success(f"Verification complete. OK: {ok_count:,}. Not OK: {not_ok_count:,}.")
+
+            st.dataframe(verification_export_df, use_container_width=True)
+
+            final_result_df = final_result_df.merge(
+                verification_export_df,
+                on="campaign_id",
+                how="left",
+                suffixes=("", "_verified"),
+            )
+
+        output_files["99_final_result.csv"] = dataframe_flatten_for_csv(final_result_df)
+
+        st.subheader("Downloads")
+        st.download_button(
+            label="Download final result CSV",
+            data=dataframe_to_csv_bytes(output_files["99_final_result.csv"]),
+            file_name=f"smartlead_campaign_settings_result_{run_id}.csv",
+            mime="text/csv",
+        )
+        st.download_button(
+            label="Download all outputs as ZIP",
+            data=build_zip_bytes(output_files),
+            file_name=f"smartlead_campaign_settings_outputs_{run_id}.zip",
+            mime="application/zip",
+        )
+
+    except Exception as exc:
+        st.error(str(exc))
+        st.exception(exc)
 
 
 if __name__ == "__main__":
